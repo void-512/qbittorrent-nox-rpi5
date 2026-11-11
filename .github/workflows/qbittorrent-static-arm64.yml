@@ -95,8 +95,33 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates curl gnupg git python3 xz-utils bzip2 \
-            build-essential cmake ninja-build pkg-config gawk bison flex \
-            texinfo libgmp-dev libmpfr-dev libmpc-dev linux-libc-dev
+            make binutils libc6-dev cmake ninja-build pkg-config gawk bison flex \
+            texinfo linux-libc-dev
+          # GCC 16 is packaged in Sid. Permit only binaries from its source
+          # package, including its compiler support libraries; all other Sid
+          # packages (notably libc6 and base-files) remain ineligible.
+          printf '%s\n' \
+            'deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian sid main' \
+            > /etc/apt/sources.list.d/gcc16.list
+          cat > /etc/apt/preferences.d/gcc16.pref <<'APT'
+          Package: src:gcc-16
+          Pin: release n=sid
+          Pin-Priority: 990
+
+          Package: *
+          Pin: release n=sid
+          Pin-Priority: -1
+          APT
+          apt-get update
+          apt-get install -y --no-install-recommends --no-remove gcc-16
+          /usr/bin/gcc-16 --version
+          test "$(/usr/bin/gcc-16 -dumpversion)" = 16
+          printf 'gcc\tDebian Sid apt\t%s\n' "$(/usr/bin/gcc-16 -dumpfullversion)" >> /out/versions.tsv
+          dpkg-query -W 'gcc-16' 'gcc-16-aarch64-linux-gnu' 'cpp-16' \
+            'cpp-16-aarch64-linux-gnu' 'gcc-16-base' 'libgcc-16-dev' \
+            > /out/toolchain-packages.tsv
+          # Later installations use only Trixie and LLVM's Trixie repository.
+          rm /etc/apt/sources.list.d/gcc16.list /etc/apt/preferences.d/gcc16.pref
           curl --fail --silent --show-error --location --retry 5 \
             https://apt.llvm.org/llvm-snapshot.gpg.key \
             | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
@@ -205,42 +230,6 @@ jobs:
           PY
           }
 
-          # Bootstrap only GCC's C compiler using Clang/LLD, avoiding sid/Ubuntu
-          # binaries and their newer host-glibc requirements. GCC is used solely
-          # for the glibc build. No GCC-built C++ runtime enters the executable.
-          gcc_tag="$(latest_tag gcc-mirror/gcc 'releases/gcc-(16)\.([0-9]+)\.([0-9]+)')"
-          gcc_version="${gcc_tag#releases/gcc-}"
-          printf 'gcc\tgcc-mirror/gcc\t%s\n' "$gcc_tag" >> /out/versions.tsv
-          mkdir -p "$work/src/gcc" "$work/build/gcc"
-          fetch "https://ftp.gnu.org/gnu/gcc/gcc-$gcc_version/gcc-$gcc_version.tar.xz" \
-            | tar -xJ --strip-components=1 -C "$work/src/gcc" \
-              --exclude='*/testsuite' --exclude='*/gcc/testsuite' --exclude='*/libstdc++-v3' \
-              --exclude='*/libgo' --exclude='*/libphobos'
-          (
-            cd "$work/build/gcc"
-            CXX="clang++ -stdlib=libc++" CFLAGS="$base_cflags" CXXFLAGS="$base_cxxflags" \
-              LDFLAGS="$base_ldflags" "$work/src/gcc/configure" \
-              --prefix="$work/gcc16" --enable-languages=c --disable-bootstrap \
-              --disable-multilib --disable-nls --disable-libsanitizer \
-              --disable-libquadmath --disable-libgomp --disable-libatomic --without-isl \
-              --with-as=/usr/bin/as --with-ld=/usr/bin/ld
-            make -j"$jobs" all-gcc
-            make install-strip-gcc
-          )
-          test "$("$work/gcc16/bin/gcc" -dumpversion)" = 16
-          # all-gcc does not build target libgcc. Reuse Trixie's compiler support
-          # files solely for the glibc bootstrap, rather than adding a GCC runtime
-          # to the LLVM-built application. glibc's own build also needs crt objects.
-          bootstrap_libdir="$(dirname "$(/usr/bin/gcc -print-libgcc-file-name)")"
-          gcc16_libdir="$(dirname "$("$work/gcc16/bin/gcc" -print-file-name=include)")"
-          for support in "$bootstrap_libdir"/libgcc*.a "$bootstrap_libdir"/libgcc_s.so \
-            "$bootstrap_libdir"/crt*.o; do
-            test -f "$support"
-            ln -s "$support" "$gcc16_libdir/${support##*/}"
-          done
-          completed+=("$work/src/gcc" "$work/build/gcc")
-          clean_completed
-
           # Install glibc to a private sysroot, never over Trixie's host libc.
           # GNU binutils are intentionally confined to this GCC/glibc step.
           glibc_tag="$(latest_tag bminor/glibc 'glibc-([0-9]+)\.([0-9]+)')"
@@ -254,7 +243,7 @@ jobs:
             cd "$work/build/glibc"
             # No inherited -flto, LLD, stripping or --gc-sections for glibc.
             # GCC 16 and GNU ld/as are the supported glibc build tools.
-            export CC="$work/gcc16/bin/gcc" CXX=false LD=/usr/bin/ld AS=/usr/bin/as
+            export CC=/usr/bin/gcc-16 CXX=false LD=/usr/bin/ld AS=/usr/bin/as
             export AR=/usr/bin/ar NM=/usr/bin/nm RANLIB=/usr/bin/ranlib
             export OBJCOPY=/usr/bin/objcopy OBJDUMP=/usr/bin/objdump READELF=/usr/bin/readelf
             export STRIP=/usr/bin/strip
@@ -267,7 +256,7 @@ jobs:
             make DESTDIR="$sysroot" install
           )
           test -f "$sysroot/usr/lib/libc.a"
-          completed+=("$work/src/glibc" "$work/build/glibc" "$work/gcc16")
+          completed+=("$work/src/glibc" "$work/build/glibc")
           clean_completed
 
           # Use matching LLVM 23 libc++, libc++abi, libunwind and compiler-rt.
@@ -505,7 +494,7 @@ jobs:
           install -m 0755 "$binary" /out/qbittorrent-nox
           cp "$work/version.txt" /out/
           dpkg-query -W 'clang-23' 'lld-23' 'llvm-23' 'libclang-rt-23-dev' \
-            'libc++-23-dev' 'libc++abi-23-dev' 'libunwind-23-dev' > /out/toolchain-packages.tsv
+            'libc++-23-dev' 'libc++abi-23-dev' 'libunwind-23-dev' >> /out/toolchain-packages.tsv
           printf 'CFLAGS=%s\nCXXFLAGS=%s\nLDFLAGS=%s\n' \
             "$base_cflags" "$base_cxxflags" "$base_ldflags" > /out/build-flags.txt
           cd /out
