@@ -71,7 +71,7 @@ jobs:
             --volume "$GITHUB_WORKSPACE/dist:/out" \
             debian:trixie-slim sleep infinity
 
-      - name: Build with GCC 16 and LLVM 23 inside Trixie
+      - name: Build with GCC 14 and LLVM 23 inside Trixie
         run: |
           set -euo pipefail
           docker exec -i qbt-build bash -seuo pipefail <<'BUILD'
@@ -95,39 +95,14 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates curl gnupg git python3 xz-utils bzip2 \
-            make binutils libc6-dev cmake ninja-build pkg-config gawk bison flex \
+            gcc make binutils libc6-dev cmake ninja-build pkg-config gawk bison flex \
             texinfo linux-libc-dev
-          # GCC 16 emits AArch64 .aeabi_* directives requiring newer binutils.
-          # Permit only GCC 16 and binutils source packages and their libraries
-          # from Sid; libc6, base-files, and other Sid packages stay ineligible.
-          printf '%s\n' \
-            'deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian sid main' \
-            > /etc/apt/sources.list.d/gcc16.list
-          cat > /etc/apt/preferences.d/gcc16.pref <<'APT'
-          Package: src:gcc-16 src:binutils
-          Pin: release n=sid
-          Pin-Priority: 990
-
-          Package: *
-          Pin: release n=sid
-          Pin-Priority: -1
-          APT
-          apt-get update
-          apt-get install -y --no-install-recommends --no-remove gcc-16 binutils
-          /usr/bin/gcc-16 --version
-          test "$(/usr/bin/gcc-16 -dumpversion)" = 16
-          /usr/bin/as --version
-          /usr/bin/ld --version
-          printf '%s\n' 'int main(void) { return 0; }' \
-            | /usr/bin/gcc-16 -O3 -mcpu=cortex-a76+nossbs -fno-lto \
-                -x c -c -o "$work/gcc16-probe.o" -
-          printf 'gcc\tDebian Sid apt\t%s\n' "$(/usr/bin/gcc-16 -dumpfullversion)" >> /out/versions.tsv
-          printf 'binutils\tDebian Sid apt\t%s\n' "$(dpkg-query -W -f='${Version}' binutils)" >> /out/versions.tsv
-          dpkg-query -W 'binutils' 'binutils-aarch64-linux-gnu' 'gcc-16' 'gcc-16-aarch64-linux-gnu' 'cpp-16' \
-            'cpp-16-aarch64-linux-gnu' 'gcc-16-base' 'libgcc-16-dev' \
+          # Use Trixie's default GCC and GNU binutils only for glibc.
+          /usr/bin/gcc --version
+          test "$(/usr/bin/gcc -dumpversion)" = 14
+          printf 'gcc\tDebian Trixie apt\t%s\n' "$(/usr/bin/gcc -dumpfullversion)" >> /out/versions.tsv
+          dpkg-query -W 'gcc' 'gcc-14' 'binutils' 'binutils-aarch64-linux-gnu' \
             > /out/toolchain-packages.tsv
-          # Later installations use only Trixie and LLVM's Trixie repository.
-          rm /etc/apt/sources.list.d/gcc16.list /etc/apt/preferences.d/gcc16.pref
           curl --fail --silent --show-error --location --retry 5 \
             https://apt.llvm.org/llvm-snapshot.gpg.key \
             | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
@@ -248,8 +223,8 @@ jobs:
           (
             cd "$work/build/glibc"
             # No inherited -flto, LLD, stripping or --gc-sections for glibc.
-            # GCC 16 and GNU ld/as are the supported glibc build tools.
-            export CC=/usr/bin/gcc-16 CXX=false LD=/usr/bin/ld AS=/usr/bin/as
+            # Use Trixie's GCC 14 and GNU ld/as for glibc.
+            export CC=/usr/bin/gcc CXX=false LD=/usr/bin/ld AS=/usr/bin/as
             export AR=/usr/bin/ar NM=/usr/bin/nm RANLIB=/usr/bin/ranlib
             export OBJCOPY=/usr/bin/objcopy OBJDUMP=/usr/bin/objdump READELF=/usr/bin/readelf
             export STRIP=/usr/bin/strip
