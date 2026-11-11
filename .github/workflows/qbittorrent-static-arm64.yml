@@ -94,7 +94,7 @@ jobs:
           apt-get "${apt_options[@]}" install -y --no-install-recommends \
             ca-certificates curl gnupg git python3 xz-utils bzip2 \
             gcc make binutils libc6-dev cmake ninja-build pkg-config gawk bison flex \
-            texinfo linux-libc-dev
+            texinfo linux-libc-dev tcl
           # Use Trixie's default GCC and GNU binutils only for glibc.
           gcc="$(command -v gcc)"
           gnu_bin="$(dirname "$(command -v ld)")"
@@ -336,51 +336,24 @@ jobs:
           completed+=("$work/src/openssl")
           clean_completed
 
-          # Boost.System is header-only in current Boost releases. Install all
-          # headers plus an honest header-only CMake package; no b2/GCC fallback.
+          # Install all Boost headers and official CMake metadata through B2.
+          # Build its engine explicitly: bootstrap.sh otherwise discards CXXFLAGS.
           boost_tag="$(latest_tag boostorg/boost 'boost-([0-9]+)\.([0-9]+)\.([0-9]+)')"
-          boost_version="${boost_tag#boost-}"
-          IFS=. read -r boost_major boost_minor boost_patch <<< "$boost_version"
           printf 'boost\tboostorg/boost\t%s\n' "$boost_tag" >> "$OUTPUT_DIR/versions.tsv"
           mkdir -p "$work/src/boost"
-          fetch "https://archives.boost.io/release/$boost_version/source/boost_${boost_version//./_}.tar.bz2" \
-            | tar -xj --strip-components=1 -C "$work/src/boost" "boost_${boost_version//./_}/boost"
-          mkdir -p "$prefix/include" "$prefix/lib/cmake/Boost"
-          mv "$work/src/boost/boost" "$prefix/include/"
-          cat > "$prefix/lib/cmake/Boost/BoostConfig.cmake" <<CMAKE
-          set(Boost_VERSION "$boost_version")
-          set(Boost_VERSION_STRING "$boost_version")
-          set(Boost_VERSION_MACRO "$((boost_major * 100000 + boost_minor * 100 + boost_patch))")
-          set(Boost_MAJOR_VERSION "$boost_major")
-          set(Boost_MINOR_VERSION "$boost_minor")
-          set(Boost_SUBMINOR_VERSION "$boost_patch")
-          set(Boost_INCLUDE_DIRS "$prefix/include")
-          set(Boost_FOUND TRUE)
-          if(NOT TARGET Boost::headers)
-            add_library(Boost::headers INTERFACE IMPORTED)
-            set_target_properties(Boost::headers PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "$prefix/include")
-            add_library(Boost::boost ALIAS Boost::headers)
-          endif()
-          foreach(component IN LISTS Boost_FIND_COMPONENTS)
-            if(component STREQUAL "headers" OR component STREQUAL "system")
-              set(Boost_\${component}_FOUND TRUE)
-              if(NOT TARGET Boost::\${component})
-                add_library(Boost::\${component} INTERFACE IMPORTED)
-                set_target_properties(Boost::\${component} PROPERTIES INTERFACE_LINK_LIBRARIES Boost::headers)
-              endif()
-            else()
-              set(Boost_FOUND FALSE)
-              set(Boost_NOT_FOUND_MESSAGE "This build installs header-only Boost components")
-            endif()
-          endforeach()
-          CMAKE
-          cat > "$work/boost-version.cmake" <<'CMAKE'
-          include(CMakePackageConfigHelpers)
-          write_basic_package_version_file("$ENV{boost_config_dir}/BoostConfigVersion.cmake"
-            VERSION "$ENV{boost_release}" COMPATIBILITY SameMajorVersion ARCH_INDEPENDENT)
-          CMAKE
-          boost_config_dir="$prefix/lib/cmake/Boost" boost_release="$boost_version" \
-            cmake -P "$work/boost-version.cmake"
+          fetch "https://github.com/boostorg/boost/releases/download/$boost_tag/$boost_tag-b2-nodocs.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$work/src/boost"
+          (
+            cd "$work/src/boost"
+            boost_b2="$work/src/boost/tools/build/src/engine/b2"
+            ./tools/build/src/engine/build.sh cxx --cxx="$CXX" \
+              --cxxflags="$CXXFLAGS $LDFLAGS -pthread"
+            ./bootstrap.sh --with-bjam="$boost_b2" --with-toolset=clang \
+              --with-libraries=headers --without-icu --prefix="$prefix"
+            "$boost_b2" --with-headers --prefix="$prefix" --layout=system \
+              toolset=clang cxxstd=26 cxxflags="$CXXFLAGS" linkflags="$LDFLAGS" \
+              link=static -j"$jobs" /boost/headers//install
+          )
           completed+=("$work/src/boost")
           clean_completed
 
@@ -389,16 +362,14 @@ jobs:
             -Ddeprecated-functions=OFF -Dwebtorrent=OFF
 
           clone_release double-conversion google/double-conversion 'v([0-9]+)\.([0-9]+)\.([0-9]+)'
-          # This project explicitly sets C++11; preserve the workflow's C++26 policy.
-          sed -i -E 's/(set\(CMAKE_CXX_STANDARD[[:space:]]+)[0-9]+/\126/' \
-            "$work/src/double-conversion/CMakeLists.txt"
+          # Upstream honors the common CMAKE_CXX_STANDARD=26 setting.
           cmake_build double-conversion -DBUILD_TESTING=OFF
 
           clone_release pcre2 PCRE2Project/pcre2 'pcre2-([0-9]+)\.([0-9]+)'
           cmake_build pcre2 -DPCRE2_BUILD_PCRE2_16=ON -DPCRE2_BUILD_PCRE2GREP=OFF \
             -DPCRE2_BUILD_TESTS=OFF -DPCRE2_SUPPORT_JIT=ON
 
-          # SQLite's official amalgamation avoids compiling its Tcl generators.
+          # Use SQLite's upstream configure and static-library install targets.
           sqlite_path="$(fetch https://www.sqlite.org/download.html | python3 -c '
           import re, sys
           candidates = re.findall(r"([0-9]{4}/sqlite-autoconf-([0-9]+)\.tar\.gz)", sys.stdin.read())
@@ -409,16 +380,17 @@ jobs:
           mkdir -p "$work/src/sqlite"
           fetch "https://www.sqlite.org/$sqlite_path" \
             | tar -xz --strip-components=1 -C "$work/src/sqlite"
-          cat > "$work/src/sqlite/CMakeLists.txt" <<'CMAKE'
-          cmake_minimum_required(VERSION 3.20)
-          project(sqlite C)
-          add_library(sqlite3 STATIC sqlite3.c)
-          target_compile_definitions(sqlite3 PRIVATE SQLITE_THREADSAFE=1 SQLITE_OMIT_LOAD_EXTENSION
-            SQLITE_ENABLE_COLUMN_METADATA SQLITE_ENABLE_FTS5 SQLITE_ENABLE_RTREE)
-          install(TARGETS sqlite3 ARCHIVE DESTINATION lib)
-          install(FILES sqlite3.h sqlite3ext.h DESTINATION include)
-          CMAKE
-          cmake_build sqlite
+          mkdir -p "$work/build/sqlite"
+          (
+            cd "$work/build/sqlite"
+            autosetup_tclsh="$(command -v tclsh)" CC_FOR_BUILD="$CC" \
+              "$work/src/sqlite/configure" --prefix="$prefix" --libdir="$prefix/lib" \
+              --disable-shared --enable-static --disable-load-extension --disable-readline \
+              --disable-math --disable-carray --fts5 --rtree --column-metadata
+            make -j"$jobs" install-lib install-headers install-pc
+          )
+          completed+=("$work/src/sqlite" "$work/build/sqlite")
+          clean_completed
 
           # QtBase and QtTools must have exactly the same latest stable Qt tag.
           qt_tag="$(latest_tag qt/qtbase 'v(6)\.([0-9]+)\.([0-9]+)')"
@@ -427,8 +399,9 @@ jobs:
             git clone --depth 1 --branch "$qt_tag" "https://github.com/qt/$module.git" "$work/src/$module"
             rm -rf "$work/src/$module/.git"
           done
-          # qlalr only regenerates Qt developer grammars; qBittorrent does not
-          # need it, and its legacy comparisons do not compile with libc++/C++26.
+          # Retain this narrow workaround: QtBase adds qlalr unconditionally,
+          # without a feature switch, and its iterator comparisons fail with
+          # libc++ 23/C++26. qBittorrent does not need this developer-only tool.
           sed -i '/^add_subdirectory(qlalr)$/d' "$work/src/qtbase/src/tools/CMakeLists.txt"
           # Static Qt otherwise embeds the temporary build prefix in runtime
           # paths, including qtlogging.ini. Resolve them relative to the executable.
@@ -460,7 +433,8 @@ jobs:
           mimalloc_object="${mimalloc_objects[0]}"
 
           clone_release qbittorrent qbittorrent/qBittorrent 'release-([0-9]+)\.([0-9]+)\.([0-9]+)'
-          # Full LTO exposes an upstream initialization-order bug: EOH can be
+          # Retain the HTTP correctness fix: no upstream build option controls
+          # this initializer. Full LTO exposes an initialization-order bug: EOH can be
           # constructed before the inline CRLF QByteArray and become empty.
           # Use an independent constant view; keep newer upstream fixes intact.
           python3 - "$work/src/qbittorrent/src/base/http/requestparser.cpp" <<'PY_HTTP'
