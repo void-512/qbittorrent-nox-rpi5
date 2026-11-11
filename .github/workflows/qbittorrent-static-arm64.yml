@@ -218,8 +218,11 @@ jobs:
           mkdir -p "$work/src/glibc" "$work/build/glibc" "$sysroot/usr/include"
           fetch "https://ftp.gnu.org/gnu/libc/$glibc_tag.tar.xz" \
             | tar -xJ --strip-components=1 -C "$work/src/glibc"
-          cp -a /usr/include/linux /usr/include/asm-generic "$sysroot/usr/include/"
-          cp -a /usr/include/aarch64-linux-gnu/asm "$sysroot/usr/include/"
+          # Debian UAPI headers can link outside /usr/include; materialize them
+          # so relative symlinks cannot become dangling inside the private sysroot.
+          cp -aL /usr/include/linux /usr/include/asm-generic "$sysroot/usr/include/"
+          cp -aL /usr/include/aarch64-linux-gnu/asm "$sysroot/usr/include/"
+          test -r "$sysroot/usr/include/asm/errno.h"
           (
             cd "$work/build/glibc"
             # No inherited -flto, LLD, stripping or --gc-sections for glibc.
