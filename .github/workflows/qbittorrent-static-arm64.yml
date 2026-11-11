@@ -148,7 +148,21 @@ jobs:
           build_pid=$$
           monitor_ram &
           monitor_pid=$!
-          trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
+          finish_build() {
+            local result=$? log
+            kill "$monitor_pid" 2>/dev/null || true
+            if (( result != 0 )); then
+              mkdir -p /out/diagnostics
+              for log in "$work"/*.log "$work"/*.txt "$work/qbittorrent.map"; do
+                if [[ -f "$log" ]]; then cp "$log" /out/diagnostics/; fi
+              done
+              if [[ -x "$prefix/bin/qbittorrent-nox" ]]; then
+                cp "$prefix/bin/qbittorrent-nox" /out/diagnostics/
+              fi
+            fi
+            exit "$result"
+          }
+          trap finish_build EXIT
           clean_completed() {
             if ((${#completed[@]})); then rm -rf -- "${completed[@]}"; completed=(); fi
             used="$(df --output=pcent "$work" | tail -n1 | tr -dc '0-9')"
@@ -469,20 +483,28 @@ jobs:
             > "$work/version.txt" 2> "$work/mimalloc.txt"
           grep -qi mimalloc "$work/mimalloc.txt"
           chroot "$smoke_root" /qbittorrent-nox --help > /dev/null
-          # Exercise Qt, SQLite, libtorrent, allocator and the built-in WebUI.
-          chroot "$smoke_root" /qbittorrent-nox \
-            --confirm-legal-notice --profile=/tmp/smoke-profile --webui-port=18080 \
+          # Exercise the WebUI in the target Trixie environment, which provides
+          # standard OS facilities such as /proc, user records and locale data.
+          # The library-free chroot above separately verifies static startup.
+          "$binary" --confirm-legal-notice --profile="$work/smoke-profile" --webui-port=18080 \
             > "$work/smoke.log" 2>&1 &
           qbt_pid=$!
           ready=false
           for ((attempt=0; attempt<60; attempt++)); do
-            if curl --fail --silent http://127.0.0.1:18080/ > /dev/null; then ready=true; break; fi
+            if curl --noproxy '*' --fail --silent http://127.0.0.1:18080/ > "$work/smoke-response.txt"; then ready=true; break; fi
             kill -0 "$qbt_pid"
             sleep 1
           done
+          if [[ "$ready" != true ]]; then
+            cat "$work/smoke.log"
+            curl --noproxy '*' --verbose http://127.0.0.1:18080/ || true
+            kill -TERM "$qbt_pid" || true
+            wait "$qbt_pid" || true
+            printf '%s\n' '::error::WebUI did not become ready.' >&2
+            exit 1
+          fi
           kill -TERM "$qbt_pid"
           wait "$qbt_pid"
-          test "$ready" = true
           "$STRIP" --strip-all "$binary"
           install -m 0755 "$binary" /out/qbittorrent-nox
           cp "$work/version.txt" /out/
@@ -502,6 +524,14 @@ jobs:
           path: dist/
           if-no-files-found: error
           compression-level: 0
+
+      - name: Upload failed-build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: qbittorrent-build-failure-diagnostics
+          path: dist/
+          if-no-files-found: warn
 
       - name: Stop isolated Docker and release RAM
         if: always()
