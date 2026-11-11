@@ -1,0 +1,540 @@
+name: Static qBittorrent for Debian 13 ARM64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: static-qbittorrent-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Fixed policy: no qbt_optimise/qbt_use_lto or inherited script options.
+      CFLAGS: -O3 -mcpu=cortex-a76+nossbs+noras -flto -ffunction-sections -fdata-sections
+      CXXFLAGS: -O3 -mcpu=cortex-a76+nossbs+noras -flto -ffunction-sections -fdata-sections -std=c++26
+      LDFLAGS: -fuse-ld=lld -flto -Wl,-O3 -Wl,--strip-all -Wl,--gc-sections
+
+    steps:
+      # A job-level `container:` would use the runner's system Docker daemon.
+      # Keep the entire isolated daemon, writable container, and build in one
+      # bounded 4 GiB tmpfs instead. Nothing changes the system Docker service.
+      - name: Start isolated Docker in RAM
+        run: |
+          set -euo pipefail
+          docker --version
+          dockerd --version
+          ram_root="$HOME/.cache/codex-docker"
+          mkdir -p "$ram_root"
+          test -z "$(ls -A "$ram_root")"
+          sudo mount -t tmpfs -o size=4G,mode=0700 tmpfs "$ram_root"
+          sudo chown "$(id -u):$(id -g)" "$ram_root"
+          test "$(findmnt -n -o FSTYPE -T "$ram_root")" = tmpfs
+          mkdir -p "$ram_root/data" "$ram_root/exec" "$ram_root/tmp"
+          printf '%s\n' '{"features":{"containerd-snapshotter":false},"log-driver":"none"}' \
+            > "$ram_root/daemon.json"
+          # Docker-managed containerd also stores its root/state under these
+          # data/exec roots; disabling the image store avoids a system containerd.
+          # The log is owned by the runner; the shell opens this redirect before sudo.
+          # shellcheck disable=SC2024
+          sudo env TMPDIR="$ram_root/tmp" TMP="$ram_root/tmp" TEMP="$ram_root/tmp" \
+            dockerd --config-file "$ram_root/daemon.json" \
+            --data-root "$ram_root/data" --exec-root "$ram_root/exec" \
+            --pidfile "$ram_root/dockerd.pid" --host "unix://$ram_root/docker.sock" \
+            --group "$(id -gn)" --storage-driver overlay2 \
+            --bridge none --iptables=false --ip6tables=false \
+            --ip-forward=false --ip-masq=false --userland-proxy=false \
+            > "$ram_root/dockerd.log" 2>&1 &
+          export DOCKER_HOST="unix://$ram_root/docker.sock"
+          for ((attempt=0; attempt<60; attempt++)); do
+            if docker info > /dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          test "$(docker info --format '{{.DockerRootDir}}')" = "$ram_root/data"
+          printf 'DOCKER_HOST=%s\n' "$DOCKER_HOST" >> "$GITHUB_ENV"
+          printf 'RAM_ROOT=%s\n' "$ram_root" >> "$GITHUB_ENV"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          docker run --detach --name qbt-build --network host --log-driver none \
+            --env DEBIAN_FRONTEND=noninteractive --env LANG=C.UTF-8 --env LC_ALL=C.UTF-8 \
+            --env CFLAGS --env CXXFLAGS --env LDFLAGS \
+            --env TMPDIR=/root/.cache/codex-tmp/qbt --env TMP=/root/.cache/codex-tmp/qbt \
+            --env TEMP=/root/.cache/codex-tmp/qbt \
+            --volume "$ram_root/tmp:/root/.cache/codex-tmp" \
+            --volume "$GITHUB_WORKSPACE/dist:/out" \
+            debian:trixie-slim sleep infinity
+
+      - name: Build with GCC 16 and LLVM 23 inside Trixie
+        run: |
+          set -euo pipefail
+          docker exec -i qbt-build bash -seuo pipefail <<'BUILD'
+          set -euo pipefail
+          mkdir -p "$TMPDIR"
+          cd "$TMPDIR"
+          work="$TMPDIR"
+          prefix="$work/prefix"
+          sysroot="$work/sysroot"
+          mkdir -p "$prefix" "$sysroot" "$work/src" "$work/build"
+          test "$(stat -f -c %T "$work")" = tmpfs
+          test "$(dpkg --print-architecture)" = arm64
+          . /etc/os-release
+          test "$VERSION_ID" = 13
+
+          # APT is only for bootstrap/build tools and LLVM's matching runtimes.
+          # Application libraries are built below from their newest stable tags.
+          mkdir -p /etc/apt/apt.conf.d
+          printf '%s\n' 'Binary::apt::APT::Keep-Downloaded-Packages "false";' \
+            'APT::Keep-Downloaded-Packages "false";' > /etc/apt/apt.conf.d/99-no-cache
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg git python3 xz-utils bzip2 \
+            build-essential cmake ninja-build pkg-config gawk bison flex \
+            texinfo libgmp-dev libmpfr-dev libmpc-dev linux-libc-dev
+          curl --fail --silent --show-error --location --retry 5 \
+            https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+          printf '%s\n' \
+            'deb [signed-by=/usr/share/keyrings/llvm.gpg] https://apt.llvm.org/trixie/ llvm-toolchain-trixie-23 main' \
+            > /etc/apt/sources.list.d/llvm23.list
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            clang-23 lld-23 llvm-23 llvm-23-tools libclang-rt-23-dev \
+            libc++-23-dev libc++abi-23-dev libunwind-23-dev
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+
+          export PATH="/usr/lib/llvm-23/bin:$PATH"
+          export CC=clang CXX=clang++ LD=ld.lld AR=llvm-ar NM=llvm-nm
+          export RANLIB=llvm-ranlib STRIP=llvm-strip OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump READELF=llvm-readelf SIZE=llvm-size
+          # Clang's integrated assembler handles .S inputs. llvm-as is an LLVM IR
+          # assembler and must never be used as the platform assembly compiler.
+          export AS=clang
+          clang --version
+          ld.lld --version
+          test "$(clang -dumpversion | cut -d. -f1)" = 23
+          jobs="$(nproc)"
+          export CMAKE_BUILD_PARALLEL_LEVEL="$jobs"
+          base_cflags="$CFLAGS"
+          base_cxxflags="$CXXFLAGS"
+          base_ldflags="$LDFLAGS"
+
+          # Only completed directories enter this list. Clean them immediately;
+          # an 80% monitor is a second safeguard. Never remove active work.
+          completed=()
+          monitor_ram() {
+            while sleep 5; do
+              used="$(df --output=pcent "$work" | tail -n1 | tr -dc '0-9')"
+              if (( used >= 95 )); then
+                printf '%s\n' '::error::4 GiB RAM build storage exhausted; no disk fallback.' >&2
+                kill -TERM "$build_pid"
+                return
+              fi
+            done
+          }
+          build_pid=$$
+          monitor_ram &
+          monitor_pid=$!
+          trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
+          clean_completed() {
+            if ((${#completed[@]})); then rm -rf -- "${completed[@]}"; completed=(); fi
+            used="$(df --output=pcent "$work" | tail -n1 | tr -dc '0-9')"
+            if (( used > 80 )); then
+              printf '%s\n' '::error::RAM storage exceeds 80% after completed-work cleanup.' >&2
+              exit 1
+            fi
+          }
+          fetch() { curl --fail --location --retry 5 --retry-all-errors "$1"; }
+          # Sort numerical release tags, excluding RC/beta/branch builds. Resolve
+          # at run time rather than hard-coding yesterday's dependency versions.
+          latest_tag() {
+            git ls-remote --tags --refs "https://github.com/$1.git" \
+              | python3 -c '
+          import re, sys
+          pattern = re.compile(sys.argv[1])
+          tags = [line.split("refs/tags/", 1)[1].strip() for line in sys.stdin]
+          candidates = [(tuple(map(int, m.groups())), tag)
+                        for tag in tags if (m := pattern.fullmatch(tag))]
+          if not candidates:
+              sys.exit("No stable release matching " + sys.argv[1])
+          print(max(candidates)[1])
+          ' "$2"
+          }
+          clone_release() {
+            local name="$1" repo="$2" pattern="$3" tag
+            tag="$(latest_tag "$repo" "$pattern")"
+            printf '%s\t%s\t%s\n' "$name" "$repo" "$tag" >> /out/versions.tsv
+            git clone --depth 1 --branch "$tag" --recurse-submodules --shallow-submodules \
+              "https://github.com/$repo.git" "$work/src/$name"
+            git -C "$work/src/$name" rev-parse HEAD >> /out/source-commits.txt
+            rm -rf "$work/src/$name/.git"
+          }
+          cmake_build() {
+            local name="$1"
+            shift
+            cmake -S "$work/src/$name" -B "$work/build/$name" -G Ninja \
+              -DCMAKE_TOOLCHAIN_FILE="$work/llvm23.cmake" \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
+              -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+              -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=OFF \
+              -DCMAKE_CXX_STANDARD=26 -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+              -DCMAKE_CXX_EXTENSIONS=OFF "$@"
+            check_cxx26 "$work/build/$name/compile_commands.json"
+            cmake --build "$work/build/$name"
+            cmake --install "$work/build/$name"
+            completed+=("$work/src/$name" "$work/build/$name")
+            clean_completed
+          }
+          check_cxx26() {
+            python3 - "$1" <<'PY'
+          import json, pathlib, shlex, sys
+          for entry in json.load(open(sys.argv[1])):
+              if pathlib.Path(entry["file"]).suffix not in (".cpp", ".cc", ".cxx", ".C", ".mm"):
+                  continue
+              args = entry.get("arguments") or shlex.split(entry["command"])
+              standards = [arg for arg in args if arg.startswith("-std=")]
+              if not standards or standards[-1] not in ("-std=c++26", "-std=gnu++26", "-std=c++2c", "-std=gnu++2c"):
+                  sys.exit("C++26 policy overridden for " + entry["file"] + ": " + str(standards))
+          PY
+          }
+
+          # Bootstrap only GCC's C compiler using Clang/LLD, avoiding sid/Ubuntu
+          # binaries and their newer host-glibc requirements. GCC is used solely
+          # for the glibc build. No GCC-built C++ runtime enters the executable.
+          gcc_tag="$(latest_tag gcc-mirror/gcc 'releases/gcc-(16)\.([0-9]+)\.([0-9]+)')"
+          gcc_version="${gcc_tag#releases/gcc-}"
+          printf 'gcc\tgcc-mirror/gcc\t%s\n' "$gcc_tag" >> /out/versions.tsv
+          mkdir -p "$work/src/gcc" "$work/build/gcc"
+          fetch "https://ftp.gnu.org/gnu/gcc/gcc-$gcc_version/gcc-$gcc_version.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$work/src/gcc" \
+              --exclude='*/testsuite' --exclude='*/gcc/testsuite' --exclude='*/libstdc++-v3' \
+              --exclude='*/libgo' --exclude='*/libphobos'
+          (
+            cd "$work/build/gcc"
+            CXX="clang++ -stdlib=libc++" CFLAGS="$base_cflags" CXXFLAGS="$base_cxxflags" \
+              LDFLAGS="$base_ldflags" "$work/src/gcc/configure" \
+              --prefix="$work/gcc16" --enable-languages=c --disable-bootstrap \
+              --disable-multilib --disable-nls --disable-libsanitizer \
+              --disable-libquadmath --disable-libgomp --disable-libatomic --without-isl \
+              --with-as=/usr/bin/as --with-ld=/usr/bin/ld
+            make -j"$jobs" all-gcc
+            make install-strip-gcc
+          )
+          test "$("$work/gcc16/bin/gcc" -dumpversion)" = 16
+          # all-gcc does not build target libgcc. Reuse Trixie's compiler support
+          # files solely for the glibc bootstrap, rather than adding a GCC runtime
+          # to the LLVM-built application. glibc's own build also needs crt objects.
+          bootstrap_libdir="$(dirname "$(/usr/bin/gcc -print-libgcc-file-name)")"
+          gcc16_libdir="$(dirname "$("$work/gcc16/bin/gcc" -print-file-name=include)")"
+          for support in "$bootstrap_libdir"/libgcc*.a "$bootstrap_libdir"/libgcc_s.so \
+            "$bootstrap_libdir"/crt*.o; do
+            test -f "$support"
+            ln -s "$support" "$gcc16_libdir/${support##*/}"
+          done
+          completed+=("$work/src/gcc" "$work/build/gcc")
+          clean_completed
+
+          # Install glibc to a private sysroot, never over Trixie's host libc.
+          # GNU binutils are intentionally confined to this GCC/glibc step.
+          glibc_tag="$(latest_tag bminor/glibc 'glibc-([0-9]+)\.([0-9]+)')"
+          printf 'glibc\tbminor/glibc\t%s\n' "$glibc_tag" >> /out/versions.tsv
+          mkdir -p "$work/src/glibc" "$work/build/glibc" "$sysroot/usr/include"
+          fetch "https://ftp.gnu.org/gnu/libc/$glibc_tag.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$work/src/glibc"
+          cp -a /usr/include/linux /usr/include/asm-generic "$sysroot/usr/include/"
+          cp -a /usr/include/aarch64-linux-gnu/asm "$sysroot/usr/include/"
+          (
+            cd "$work/build/glibc"
+            # No inherited -flto, LLD, stripping or --gc-sections for glibc.
+            # GCC 16 and GNU ld/as are the supported glibc build tools.
+            export CC="$work/gcc16/bin/gcc" CXX=false LD=/usr/bin/ld AS=/usr/bin/as
+            export AR=/usr/bin/ar NM=/usr/bin/nm RANLIB=/usr/bin/ranlib
+            export OBJCOPY=/usr/bin/objcopy OBJDUMP=/usr/bin/objdump READELF=/usr/bin/readelf
+            export STRIP=/usr/bin/strip
+            export CFLAGS='-O3 -mcpu=cortex-a76+nossbs+noras -fno-lto'
+            export CXXFLAGS="$CFLAGS" LDFLAGS='-fno-lto'
+            "$work/src/glibc/configure" --prefix=/usr --libdir=/usr/lib \
+              --with-headers="$sysroot/usr/include" --enable-kernel=6.12 \
+              --enable-static-nss --disable-nscd --disable-werror
+            make -j"$jobs"
+            make DESTDIR="$sysroot" install
+          )
+          test -f "$sysroot/usr/lib/libc.a"
+          completed+=("$work/src/glibc" "$work/build/glibc" "$work/gcc16")
+          clean_completed
+
+          # Use matching LLVM 23 libc++, libc++abi, libunwind and compiler-rt.
+          # These are the official Trixie LLVM toolchain packages, not libstdc++.
+          # Rebase only the libc headers/startup objects through --sysroot.
+          llvm_lib=/usr/lib/llvm-23/lib
+          test -f "$llvm_lib/libc++.a"
+          test -f "$llvm_lib/libc++abi.a"
+          test -f "$llvm_lib/libunwind.a"
+          export CFLAGS="$base_cflags --sysroot=$sysroot --rtlib=compiler-rt"
+          export CXXFLAGS="$base_cxxflags --sysroot=$sysroot --rtlib=compiler-rt -stdlib=libc++ -isystem /usr/lib/llvm-23/include/c++/v1"
+          export LDFLAGS="$base_ldflags --sysroot=$sysroot --rtlib=compiler-rt --unwindlib=libunwind -L$llvm_lib -L$prefix/lib -static -no-pie -Wl,--start-group -lc++ -lc++abi -lunwind -Wl,--end-group"
+          export CPPFLAGS="-I$prefix/include"
+          export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/share/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$PKG_CONFIG_PATH"
+          export PATH="$prefix/bin:$PATH"
+          cat > "$work/llvm23.cmake" <<CMAKE
+          set(CMAKE_C_COMPILER /usr/lib/llvm-23/bin/clang)
+          set(CMAKE_CXX_COMPILER /usr/lib/llvm-23/bin/clang++)
+          set(CMAKE_ASM_COMPILER /usr/lib/llvm-23/bin/clang)
+          set(CMAKE_LINKER /usr/lib/llvm-23/bin/ld.lld)
+          set(CMAKE_AR /usr/lib/llvm-23/bin/llvm-ar)
+          set(CMAKE_RANLIB /usr/lib/llvm-23/bin/llvm-ranlib)
+          set(CMAKE_NM /usr/lib/llvm-23/bin/llvm-nm)
+          set(CMAKE_STRIP /usr/lib/llvm-23/bin/llvm-strip)
+          set(CMAKE_OBJCOPY /usr/lib/llvm-23/bin/llvm-objcopy)
+          set(CMAKE_OBJDUMP /usr/lib/llvm-23/bin/llvm-objdump)
+          set(CMAKE_READELF /usr/lib/llvm-23/bin/llvm-readelf)
+          set(CMAKE_C_COMPILER_AR /usr/lib/llvm-23/bin/llvm-ar)
+          set(CMAKE_CXX_COMPILER_AR /usr/lib/llvm-23/bin/llvm-ar)
+          set(CMAKE_C_COMPILER_RANLIB /usr/lib/llvm-23/bin/llvm-ranlib)
+          set(CMAKE_CXX_COMPILER_RANLIB /usr/lib/llvm-23/bin/llvm-ranlib)
+          set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
+          set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
+          set(CMAKE_PREFIX_PATH "$prefix")
+          set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+          set(OPENSSL_USE_STATIC_LIBS TRUE)
+          set(ZLIB_USE_STATIC_LIBS TRUE)
+          set(Boost_USE_STATIC_LIBS TRUE)
+          CMAKE
+          # Fail before the expensive dependency builds if the complete static
+          # LLVM runtime, glibc startup objects, C++26, or requested CPU flags fail.
+          printf '%s\n' '#include <iostream>' '#include <thread>' \
+            'static_assert(__cplusplus > 202302L);' \
+            'int main() { std::thread([] { std::cout << "LLVM23/C++26 OK\n"; }).join(); }' \
+            > "$work/probe.cpp"
+          "$CXX" $CXXFLAGS "$work/probe.cpp" $LDFLAGS -pthread -lc++abi -lunwind -o "$work/probe"
+          "$work/probe"
+
+          clone_release zlib-ng zlib-ng/zlib-ng '([0-9]+)\.([0-9]+)\.([0-9]+)'
+          cmake_build zlib-ng -DZLIB_COMPAT=ON -DZLIB_ENABLE_TESTS=OFF -DWITH_GTEST=OFF
+
+          clone_release openssl openssl/openssl 'openssl-([0-9]+)\.([0-9]+)\.([0-9]+)'
+          (
+            cd "$work/src/openssl"
+            ./Configure linux-aarch64 --prefix="$prefix" --libdir=lib --openssldir=/etc/ssl \
+              no-shared no-module no-dso no-tests no-docs no-comp
+            make -j"$jobs"
+            make install_sw
+          )
+          completed+=("$work/src/openssl")
+          clean_completed
+
+          # Boost.System is header-only in current Boost releases. Install all
+          # headers plus an honest header-only CMake package; no b2/GCC fallback.
+          boost_tag="$(latest_tag boostorg/boost 'boost-([0-9]+)\.([0-9]+)\.([0-9]+)')"
+          boost_version="${boost_tag#boost-}"
+          IFS=. read -r boost_major boost_minor boost_patch <<< "$boost_version"
+          printf 'boost\tboostorg/boost\t%s\n' "$boost_tag" >> /out/versions.tsv
+          mkdir -p "$work/src/boost"
+          fetch "https://archives.boost.io/release/$boost_version/source/boost_${boost_version//./_}.tar.bz2" \
+            | tar -xj --strip-components=1 -C "$work/src/boost" "boost_${boost_version//./_}/boost"
+          mkdir -p "$prefix/include" "$prefix/lib/cmake/Boost"
+          mv "$work/src/boost/boost" "$prefix/include/"
+          cat > "$prefix/lib/cmake/Boost/BoostConfig.cmake" <<CMAKE
+          set(Boost_VERSION "$boost_version")
+          set(Boost_VERSION_STRING "$boost_version")
+          set(Boost_VERSION_MACRO "$((boost_major * 100000 + boost_minor * 100 + boost_patch))")
+          set(Boost_MAJOR_VERSION "$boost_major")
+          set(Boost_MINOR_VERSION "$boost_minor")
+          set(Boost_SUBMINOR_VERSION "$boost_patch")
+          set(Boost_INCLUDE_DIRS "$prefix/include")
+          set(Boost_FOUND TRUE)
+          if(NOT TARGET Boost::headers)
+            add_library(Boost::headers INTERFACE IMPORTED)
+            set_target_properties(Boost::headers PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "$prefix/include")
+            add_library(Boost::boost ALIAS Boost::headers)
+          endif()
+          foreach(component IN LISTS Boost_FIND_COMPONENTS)
+            if(component STREQUAL "headers" OR component STREQUAL "system")
+              set(Boost_\${component}_FOUND TRUE)
+              if(NOT TARGET Boost::\${component})
+                add_library(Boost::\${component} INTERFACE IMPORTED)
+                set_target_properties(Boost::\${component} PROPERTIES INTERFACE_LINK_LIBRARIES Boost::headers)
+              endif()
+            else()
+              set(Boost_FOUND FALSE)
+              set(Boost_NOT_FOUND_MESSAGE "This build installs header-only Boost components")
+            endif()
+          endforeach()
+          CMAKE
+          cat > "$work/boost-version.cmake" <<'CMAKE'
+          include(CMakePackageConfigHelpers)
+          write_basic_package_version_file("$ENV{boost_config_dir}/BoostConfigVersion.cmake"
+            VERSION "$ENV{boost_release}" COMPATIBILITY SameMajorVersion ARCH_INDEPENDENT)
+          CMAKE
+          boost_config_dir="$prefix/lib/cmake/Boost" boost_release="$boost_version" \
+            cmake -P "$work/boost-version.cmake"
+          completed+=("$work/src/boost")
+          clean_completed
+
+          clone_release libtorrent arvidn/libtorrent 'v([0-9]+)\.([0-9]+)\.([0-9]+)'
+          cmake_build libtorrent -Dbuild_tests=OFF -Dbuild_examples=OFF -Dpython-bindings=OFF \
+            -Ddeprecated-functions=OFF -Dwebtorrent=OFF
+
+          clone_release double-conversion google/double-conversion 'v([0-9]+)\.([0-9]+)\.([0-9]+)'
+          # This project explicitly sets C++11; preserve the workflow's C++26 policy.
+          sed -i -E 's/(set\(CMAKE_CXX_STANDARD[[:space:]]+)[0-9]+/\126/' \
+            "$work/src/double-conversion/CMakeLists.txt"
+          cmake_build double-conversion -DBUILD_TESTING=OFF
+
+          clone_release pcre2 PCRE2Project/pcre2 'pcre2-([0-9]+)\.([0-9]+)'
+          cmake_build pcre2 -DPCRE2_BUILD_PCRE2_16=ON -DPCRE2_BUILD_PCRE2GREP=OFF \
+            -DPCRE2_BUILD_TESTS=OFF -DPCRE2_SUPPORT_JIT=ON
+
+          # SQLite's official amalgamation avoids compiling its Tcl generators.
+          sqlite_path="$(fetch https://www.sqlite.org/download.html | python3 -c '
+          import re, sys
+          candidates = re.findall(r"([0-9]{4}/sqlite-autoconf-([0-9]+)\.tar\.gz)", sys.stdin.read())
+          if not candidates: sys.exit("No stable SQLite amalgamation found")
+          print(max(candidates, key=lambda x: int(x[1]))[0])
+          ')"
+          printf 'sqlite\thttps://www.sqlite.org/\t%s\n' "$sqlite_path" >> /out/versions.tsv
+          mkdir -p "$work/src/sqlite"
+          fetch "https://www.sqlite.org/$sqlite_path" \
+            | tar -xz --strip-components=1 -C "$work/src/sqlite"
+          cat > "$work/src/sqlite/CMakeLists.txt" <<'CMAKE'
+          cmake_minimum_required(VERSION 3.20)
+          project(sqlite C)
+          add_library(sqlite3 STATIC sqlite3.c)
+          target_compile_definitions(sqlite3 PRIVATE SQLITE_THREADSAFE=1 SQLITE_OMIT_LOAD_EXTENSION
+            SQLITE_ENABLE_COLUMN_METADATA SQLITE_ENABLE_FTS5 SQLITE_ENABLE_RTREE)
+          install(TARGETS sqlite3 ARCHIVE DESTINATION lib)
+          install(FILES sqlite3.h sqlite3ext.h DESTINATION include)
+          CMAKE
+          cmake_build sqlite
+
+          # QtBase and QtTools must have exactly the same latest stable Qt tag.
+          qt_tag="$(latest_tag qt/qtbase 'v(6)\.([0-9]+)\.([0-9]+)')"
+          for module in qtbase qttools; do
+            printf '%s\tqt/%s\t%s\n' "$module" "$module" "$qt_tag" >> /out/versions.tsv
+            git clone --depth 1 --branch "$qt_tag" "https://github.com/qt/$module.git" "$work/src/$module"
+            rm -rf "$work/src/$module/.git"
+          done
+          cmake_build qtbase \
+            -DQT_BUILD_TESTS=OFF -DQT_BUILD_EXAMPLES=OFF -DQT_BUILD_BENCHMARKS=OFF \
+            -DQT_FEATURE_cxx26=ON -DQT_FEATURE_shared=OFF -DQT_FEATURE_static=ON \
+            -DQT_FEATURE_icu=OFF -DQT_FEATURE_gui=OFF -DQT_FEATURE_widgets=OFF \
+            -DQT_FEATURE_dbus=OFF -DQT_FEATURE_glib=OFF -DQT_FEATURE_opengl=OFF \
+            -DQT_FEATURE_openssl_linked=ON -DQT_FEATURE_openssl_runtime=OFF \
+            -DQT_FEATURE_system_zlib=ON -DQT_FEATURE_system_pcre2=ON \
+            -DQT_FEATURE_system_doubleconversion=ON -DQT_FEATURE_system_sqlite=ON \
+            -DQT_FEATURE_sql_sqlite=ON -DQT_FEATURE_sql_mysql=OFF -DQT_FEATURE_sql_odbc=OFF \
+            -DQT_FEATURE_sql_psql=OFF -DQT_FEATURE_sql_ibase=OFF -DQT_FEATURE_sql_oci=OFF \
+            -DQT_FEATURE_brotli=OFF -DQT_FEATURE_zstd=OFF -DQT_FEATURE_libproxy=OFF \
+            -DQT_FEATURE_gssapi=OFF -DQT_FEATURE_journald=OFF -DQT_FEATURE_syslog=OFF
+          cmake_build qttools -DQT_BUILD_TESTS=OFF -DQT_BUILD_EXAMPLES=OFF \
+            -DQT_FEATURE_linguist=ON -DQT_FEATURE_assistant=OFF -DQT_FEATURE_designer=OFF \
+            -DQT_FEATURE_qdoc=OFF -DQT_FEATURE_clang=OFF
+
+          clone_release mimalloc microsoft/mimalloc 'v([0-9]+)\.([0-9]+)\.([0-9]+)'
+          cmake_build mimalloc -DMI_BUILD_SHARED=OFF -DMI_BUILD_STATIC=ON -DMI_BUILD_OBJECT=ON \
+            -DMI_BUILD_TESTS=OFF -DMI_OVERRIDE=ON -DMI_USE_CXX=OFF -DMI_OPT_ARCH=OFF \
+            -DMI_INSTALL_TOPLEVEL=ON
+          # The documented single object override wins over libc's allocator.
+          # Discover the installed file instead of hard-coding a mimalloc version.
+          mapfile -t mimalloc_objects < <(find "$prefix" -name mimalloc.o -type f)
+          test "${#mimalloc_objects[@]}" = 1
+          mimalloc_object="${mimalloc_objects[0]}"
+
+          clone_release qbittorrent qbittorrent/qBittorrent 'release-([0-9]+)\.([0-9]+)\.([0-9]+)'
+          cmake -S "$work/src/qbittorrent" -B "$work/build/qbittorrent" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$work/llvm23.cmake" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_CXX_STANDARD=26 \
+            -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS $mimalloc_object -Wl,-Map,$work/qbittorrent.map" \
+            -DGUI=OFF -DWEBUI=ON -DSTACKTRACE=OFF -DDBUS=OFF -DSYSTEMD=OFF \
+            -DBUILD_SHARED_LIBS=OFF -DTESTING=OFF
+          check_cxx26 "$work/build/qbittorrent/compile_commands.json"
+          cmake --build "$work/build/qbittorrent"
+          cmake --install "$work/build/qbittorrent"
+          binary="$prefix/bin/qbittorrent-nox"
+          "$READELF" -h "$binary" | grep -q 'Machine:.*AArch64'
+          "$READELF" -l "$binary" > "$work/program-headers.txt"
+          "$READELF" -d "$binary" > "$work/dynamic-section.txt"
+          if grep -Eq 'INTERP' "$work/program-headers.txt" || grep -q NEEDED "$work/dynamic-section.txt"; then
+            printf '%s\n' '::error::Executable still needs a dynamic loader or shared library.' >&2
+            exit 1
+          fi
+          grep -Fq "$mimalloc_object" "$work/qbittorrent.map"
+          grep -Fq "$sysroot/usr/lib/libc.a" "$work/qbittorrent.map"
+          if grep -Eq 'libstdc\+\+|libgcc|libicu' "$work/qbittorrent.map"; then
+            printf '%s\n' '::error::Unexpected GCC runtime or ICU in the final link.' >&2
+            exit 1
+          fi
+          # Test with no shared libraries present, so accidental dlopen/NSS
+          # dependencies cannot be concealed by the build container's libraries.
+          smoke_root="$work/smoke-root"
+          mkdir -p "$smoke_root/etc/ssl/certs" "$smoke_root/dev" "$smoke_root/tmp"
+          cp "$binary" "$smoke_root/qbittorrent-nox"
+          cp /etc/resolv.conf /etc/hosts /etc/nsswitch.conf "$smoke_root/etc/"
+          cp /etc/ssl/certs/ca-certificates.crt "$smoke_root/etc/ssl/certs/"
+          mknod -m 666 "$smoke_root/dev/null" c 1 3
+          mknod -m 666 "$smoke_root/dev/urandom" c 1 9
+          MIMALLOC_VERBOSE=1 chroot "$smoke_root" /qbittorrent-nox --version \
+            > "$work/version.txt" 2> "$work/mimalloc.txt"
+          grep -qi mimalloc "$work/mimalloc.txt"
+          chroot "$smoke_root" /qbittorrent-nox --help > /dev/null
+          # Exercise Qt, SQLite, libtorrent, allocator and the built-in WebUI.
+          chroot "$smoke_root" /qbittorrent-nox \
+            --confirm-legal-notice --profile=/tmp/smoke-profile --webui-port=18080 \
+            > "$work/smoke.log" 2>&1 &
+          qbt_pid=$!
+          ready=false
+          for ((attempt=0; attempt<60; attempt++)); do
+            if curl --fail --silent http://127.0.0.1:18080/ > /dev/null; then ready=true; break; fi
+            kill -0 "$qbt_pid"
+            sleep 1
+          done
+          kill -TERM "$qbt_pid"
+          wait "$qbt_pid"
+          test "$ready" = true
+          "$STRIP" --strip-all "$binary"
+          install -m 0755 "$binary" /out/qbittorrent-nox
+          cp "$work/version.txt" /out/
+          dpkg-query -W 'clang-23' 'lld-23' 'llvm-23' 'libclang-rt-23-dev' \
+            'libc++-23-dev' 'libc++abi-23-dev' 'libunwind-23-dev' > /out/toolchain-packages.tsv
+          printf 'CFLAGS=%s\nCXXFLAGS=%s\nLDFLAGS=%s\n' \
+            "$base_cflags" "$base_cxxflags" "$base_ldflags" > /out/build-flags.txt
+          cd /out
+          sha256sum qbittorrent-nox > SHA256SUMS
+          cat version.txt versions.tsv SHA256SUMS
+          BUILD
+
+      - name: Upload standalone executable and build manifest
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: qbittorrent-nox-debian13-arm64-cortex-a76
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Stop isolated Docker and release RAM
+        if: always()
+        run: |
+          set -euo pipefail
+          ram_root="$HOME/.cache/codex-docker"
+          if ! mountpoint -q "$ram_root"; then exit 0; fi
+          export DOCKER_HOST="unix://$ram_root/docker.sock"
+          docker rm --force qbt-build > /dev/null 2>&1 || true
+          if sudo test -f "$ram_root/dockerd.pid"; then
+            daemon_pid="$(sudo cat "$ram_root/dockerd.pid")"
+            sudo kill -TERM "$daemon_pid"
+            for ((attempt=0; attempt<30; attempt++)); do
+              if ! sudo kill -0 "$daemon_pid" 2>/dev/null; then break; fi
+              sleep 1
+            done
+          fi
+          sudo umount --recursive "$ram_root"
