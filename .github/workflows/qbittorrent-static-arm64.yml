@@ -247,11 +247,16 @@ jobs:
             export AR=/usr/bin/ar NM=/usr/bin/nm RANLIB=/usr/bin/ranlib
             export OBJCOPY=/usr/bin/objcopy OBJDUMP=/usr/bin/objdump READELF=/usr/bin/readelf
             export STRIP=/usr/bin/strip
-            export CFLAGS='-O3 -mcpu=cortex-a76+nossbs+noras -fno-lto'
+            # +noras is a Clang-only CPU modifier; GCC does not accept it.
+            # Keep the full requested CPU flags for every LLVM-built component.
+            export CFLAGS='-O3 -mcpu=cortex-a76+nossbs -fno-lto'
             export CXXFLAGS="$CFLAGS" LDFLAGS='-fno-lto'
-            "$work/src/glibc/configure" --prefix=/usr --libdir=/usr/lib \
+            if ! "$work/src/glibc/configure" --prefix=/usr --libdir=/usr/lib \
               --with-headers="$sysroot/usr/include" --enable-kernel=6.12 \
-              --enable-static-nss --disable-nscd --disable-werror
+              --enable-static-nss --disable-nscd --disable-werror; then
+              cat config.log
+              exit 1
+            fi
             make -j"$jobs"
             make DESTDIR="$sysroot" install
           )
