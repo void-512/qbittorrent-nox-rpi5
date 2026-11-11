@@ -120,7 +120,7 @@ jobs:
           clang --version
           ld.lld --version
           test "$(clang -dumpversion | cut -d. -f1)" = 23
-          jobs="$(nproc)"
+          jobs=6
           export CMAKE_BUILD_PARALLEL_LEVEL="$jobs"
           base_cflags="$CFLAGS"
           base_cxxflags="$CXXFLAGS"
