@@ -97,14 +97,14 @@ jobs:
             ca-certificates curl gnupg git python3 xz-utils bzip2 \
             make binutils libc6-dev cmake ninja-build pkg-config gawk bison flex \
             texinfo linux-libc-dev
-          # GCC 16 is packaged in Sid. Permit only binaries from its source
-          # package, including its compiler support libraries; all other Sid
-          # packages (notably libc6 and base-files) remain ineligible.
+          # GCC 16 emits AArch64 .aeabi_* directives requiring newer binutils.
+          # Permit only GCC 16 and binutils source packages and their libraries
+          # from Sid; libc6, base-files, and other Sid packages stay ineligible.
           printf '%s\n' \
             'deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian sid main' \
             > /etc/apt/sources.list.d/gcc16.list
           cat > /etc/apt/preferences.d/gcc16.pref <<'APT'
-          Package: src:gcc-16
+          Package: src:gcc-16 src:binutils
           Pin: release n=sid
           Pin-Priority: 990
 
@@ -113,11 +113,17 @@ jobs:
           Pin-Priority: -1
           APT
           apt-get update
-          apt-get install -y --no-install-recommends --no-remove gcc-16
+          apt-get install -y --no-install-recommends --no-remove gcc-16 binutils
           /usr/bin/gcc-16 --version
           test "$(/usr/bin/gcc-16 -dumpversion)" = 16
+          /usr/bin/as --version
+          /usr/bin/ld --version
+          printf '%s\n' 'int main(void) { return 0; }' \
+            | /usr/bin/gcc-16 -O3 -mcpu=cortex-a76+nossbs -fno-lto \
+                -x c -c -o "$work/gcc16-probe.o" -
           printf 'gcc\tDebian Sid apt\t%s\n' "$(/usr/bin/gcc-16 -dumpfullversion)" >> /out/versions.tsv
-          dpkg-query -W 'gcc-16' 'gcc-16-aarch64-linux-gnu' 'cpp-16' \
+          printf 'binutils\tDebian Sid apt\t%s\n' "$(dpkg-query -W -f='${Version}' binutils)" >> /out/versions.tsv
+          dpkg-query -W 'binutils' 'binutils-aarch64-linux-gnu' 'gcc-16' 'gcc-16-aarch64-linux-gnu' 'cpp-16' \
             'cpp-16-aarch64-linux-gnu' 'gcc-16-base' 'libgcc-16-dev' \
             > /out/toolchain-packages.tsv
           # Later installations use only Trixie and LLVM's Trixie repository.
