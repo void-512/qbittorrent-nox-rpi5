@@ -22,6 +22,7 @@ jobs:
       CFLAGS: -O3 -mcpu=cortex-a76+nossbs+noras -flto -ffunction-sections -fdata-sections
       CXXFLAGS: -O3 -mcpu=cortex-a76+nossbs+noras -flto -ffunction-sections -fdata-sections -std=c++26
       LDFLAGS: -fuse-ld=lld -flto -Wl,-O3 -Wl,--strip-all -Wl,--gc-sections
+      OUTPUT_DIR: ${{ github.workspace }}/dist
 
     steps:
       # A job-level `container:` would use the runner's system Docker daemon.
@@ -32,13 +33,13 @@ jobs:
           set -euo pipefail
           docker --version
           dockerd --version
-          ram_root="$HOME/.cache/codex-docker"
-          mkdir -p "$ram_root"
-          test -z "$(ls -A "$ram_root")"
+          ram_root="$(mktemp -d --tmpdir="$RUNNER_TEMP")"
+          printf 'RAM_ROOT=%s\n' "$ram_root" >> "$GITHUB_ENV"
           sudo mount -t tmpfs -o size=4G,mode=0700 tmpfs "$ram_root"
           sudo chown "$(id -u):$(id -g)" "$ram_root"
           test "$(findmnt -n -o FSTYPE -T "$ram_root")" = tmpfs
-          mkdir -p "$ram_root/data" "$ram_root/exec" "$ram_root/tmp"
+          mkdir -p "$ram_root/data" "$ram_root/exec" "$ram_root/tmp" "$ram_root/work"
+          export TMPDIR="$ram_root/tmp" TMP="$ram_root/tmp" TEMP="$ram_root/tmp"
           printf '%s\n' '{"features":{"containerd-snapshotter":false},"log-driver":"none"}' \
             > "$ram_root/daemon.json"
           # Docker-managed containerd also stores its root/state under these
@@ -55,20 +56,19 @@ jobs:
             > "$ram_root/dockerd.log" 2>&1 &
           export DOCKER_HOST="unix://$ram_root/docker.sock"
           for ((attempt=0; attempt<60; attempt++)); do
-            if docker info > /dev/null 2>&1; then break; fi
+            if docker info > "$ram_root/docker-info.log" 2>&1; then break; fi
             sleep 1
           done
           test "$(docker info --format '{{.DockerRootDir}}')" = "$ram_root/data"
           printf 'DOCKER_HOST=%s\n' "$DOCKER_HOST" >> "$GITHUB_ENV"
-          printf 'RAM_ROOT=%s\n' "$ram_root" >> "$GITHUB_ENV"
-          mkdir -p "$GITHUB_WORKSPACE/dist"
+          mkdir -p "$OUTPUT_DIR"
           docker run --detach --name qbt-build --network host --log-driver none \
             --env DEBIAN_FRONTEND=noninteractive --env LANG=C.UTF-8 --env LC_ALL=C.UTF-8 \
             --env CFLAGS --env CXXFLAGS --env LDFLAGS \
-            --env TMPDIR=/root/.cache/codex-tmp/qbt --env TMP=/root/.cache/codex-tmp/qbt \
-            --env TEMP=/root/.cache/codex-tmp/qbt \
-            --volume "$ram_root/tmp:/root/.cache/codex-tmp" \
-            --volume "$GITHUB_WORKSPACE/dist:/out" \
+            --env TMPDIR="$ram_root/work" --env TMP="$ram_root/work" \
+            --env TEMP="$ram_root/work" --env OUTPUT_DIR \
+            --volume "$ram_root/work:$ram_root/work" \
+            --volume "$OUTPUT_DIR:$OUTPUT_DIR" \
             debian:trixie-slim sleep infinity
 
       - name: Build with GCC 14 and LLVM 23 inside Trixie
@@ -76,53 +76,66 @@ jobs:
           set -euo pipefail
           docker exec -i qbt-build bash -seuo pipefail <<'BUILD'
           set -euo pipefail
-          mkdir -p "$TMPDIR"
-          cd "$TMPDIR"
-          work="$TMPDIR"
+          work="$(mktemp -d)"
+          export TMPDIR="$work" TMP="$work" TEMP="$work"
+          cd "$work"
           prefix="$work/prefix"
           sysroot="$work/sysroot"
           mkdir -p "$prefix" "$sysroot" "$work/src" "$work/build"
           test "$(stat -f -c %T "$work")" = tmpfs
           test "$(dpkg --print-architecture)" = arm64
-          . /etc/os-release
-          test "$VERSION_ID" = 13
+          test "$(dpkg-query -W -f='${Version}' base-files | cut -d. -f1)" = 13
 
           # APT is only for bootstrap/build tools and LLVM's matching runtimes.
           # Application libraries are built below from their newest stable tags.
-          mkdir -p /etc/apt/apt.conf.d
-          printf '%s\n' 'Binary::apt::APT::Keep-Downloaded-Packages "false";' \
-            'APT::Keep-Downloaded-Packages "false";' > /etc/apt/apt.conf.d/99-no-cache
-          apt-get update
-          apt-get install -y --no-install-recommends \
+          apt_options=(-o APT::Keep-Downloaded-Packages=false
+            -o Binary::apt::APT::Keep-Downloaded-Packages=false)
+          apt-get "${apt_options[@]}" update
+          apt-get "${apt_options[@]}" install -y --no-install-recommends \
             ca-certificates curl gnupg git python3 xz-utils bzip2 \
             gcc make binutils libc6-dev cmake ninja-build pkg-config gawk bison flex \
             texinfo linux-libc-dev
           # Use Trixie's default GCC and GNU binutils only for glibc.
-          /usr/bin/gcc --version
-          test "$(/usr/bin/gcc -dumpversion)" = 14
-          printf 'gcc\tDebian Trixie apt\t%s\n' "$(/usr/bin/gcc -dumpfullversion)" >> /out/versions.tsv
+          gcc="$(command -v gcc)"
+          gnu_bin="$(dirname "$(command -v ld)")"
+          system_prefix="$(dirname "$(dirname "$gcc")")"
+          system_include="$system_prefix/include"
+          target_include="$sysroot$system_include"
+          target_lib="$sysroot$system_prefix/lib"
+          multiarch="$("$gcc" -dumpmachine)"
+          "$gcc" --version
+          test "$("$gcc" -dumpversion)" = 14
+          printf 'gcc\tDebian Trixie apt\t%s\n' "$("$gcc" -dumpfullversion)" >> "$OUTPUT_DIR/versions.tsv"
           dpkg-query -W 'gcc' 'gcc-14' 'binutils' 'binutils-aarch64-linux-gnu' \
-            > /out/toolchain-packages.tsv
+            > "$OUTPUT_DIR/toolchain-packages.tsv"
+          apt_sources='' apt_lists=''
+          eval "$(apt-config shell apt_sources Dir::Etc::sourceparts/d apt_lists Dir::State::lists/d)"
+          apt_keyrings="$(dirname "$apt_sources")/keyrings"
+          mkdir -p "$apt_keyrings"
           curl --fail --silent --show-error --location --retry 5 \
             https://apt.llvm.org/llvm-snapshot.gpg.key \
-            | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
-          printf '%s\n' \
-            'deb [signed-by=/usr/share/keyrings/llvm.gpg] https://apt.llvm.org/trixie/ llvm-toolchain-trixie-23 main' \
-            > /etc/apt/sources.list.d/llvm23.list
-          apt-get update
-          apt-get install -y --no-install-recommends \
+            | gpg --dearmor -o "$apt_keyrings/llvm.gpg"
+          printf 'deb [signed-by=%s] https://apt.llvm.org/trixie/ llvm-toolchain-trixie-23 main\n' \
+            "$apt_keyrings/llvm.gpg" > "$apt_sources/llvm23.list"
+          apt-get "${apt_options[@]}" update
+          apt-get "${apt_options[@]}" install -y --no-install-recommends \
             clang-23 lld-23 llvm-23 llvm-23-tools libclang-rt-23-dev \
             libc++-23-dev libc++abi-23-dev libunwind-23-dev
           apt-get clean
-          rm -rf /var/lib/apt/lists/*
+          rm -rf "${apt_lists:?}/"*
 
-          export PATH="/usr/lib/llvm-23/bin:$PATH"
-          export CC=clang CXX=clang++ LD=ld.lld AR=llvm-ar NM=llvm-nm
-          export RANLIB=llvm-ranlib STRIP=llvm-strip OBJCOPY=llvm-objcopy
-          export OBJDUMP=llvm-objdump READELF=llvm-readelf SIZE=llvm-size
+          llvm_bin="$(dirname "$(readlink -f "$(command -v clang-23)")")"
+          llvm_prefix="$(dirname "$llvm_bin")"
+          llvm_lib="$llvm_prefix/lib"
+          llvm_cxx_include="$llvm_prefix/include/c++/v1"
+          export PATH="$llvm_bin:$PATH"
+          export CC="$llvm_bin/clang" CXX="$llvm_bin/clang++" LD="$llvm_bin/ld.lld"
+          export AR="$llvm_bin/llvm-ar" NM="$llvm_bin/llvm-nm" RANLIB="$llvm_bin/llvm-ranlib"
+          export STRIP="$llvm_bin/llvm-strip" OBJCOPY="$llvm_bin/llvm-objcopy"
+          export OBJDUMP="$llvm_bin/llvm-objdump" READELF="$llvm_bin/llvm-readelf" SIZE="$llvm_bin/llvm-size"
           # Clang's integrated assembler handles .S inputs. llvm-as is an LLVM IR
           # assembler and must never be used as the platform assembly compiler.
-          export AS=clang
+          export AS="$CC"
           clang --version
           ld.lld --version
           test "$(clang -dumpversion | cut -d. -f1)" = 23
@@ -150,14 +163,14 @@ jobs:
           monitor_pid=$!
           finish_build() {
             local result=$? log
-            kill "$monitor_pid" 2>/dev/null || true
+            kill "$monitor_pid" 2> "$work/monitor-stop.log" || true
             if (( result != 0 )); then
-              mkdir -p /out/diagnostics
+              mkdir -p "$OUTPUT_DIR/diagnostics"
               for log in "$work"/*.log "$work"/*.txt "$work/qbittorrent.map"; do
-                if [[ -f "$log" ]]; then cp "$log" /out/diagnostics/; fi
+                if [[ -f "$log" ]]; then cp "$log" "$OUTPUT_DIR/diagnostics/"; fi
               done
               if [[ -x "$prefix/bin/qbittorrent-nox" ]]; then
-                cp "$prefix/bin/qbittorrent-nox" /out/diagnostics/
+                cp "$prefix/bin/qbittorrent-nox" "$OUTPUT_DIR/diagnostics/"
               fi
             fi
             exit "$result"
@@ -190,10 +203,10 @@ jobs:
           clone_release() {
             local name="$1" repo="$2" pattern="$3" tag
             tag="$(latest_tag "$repo" "$pattern")"
-            printf '%s\t%s\t%s\n' "$name" "$repo" "$tag" >> /out/versions.tsv
+            printf '%s\t%s\t%s\n' "$name" "$repo" "$tag" >> "$OUTPUT_DIR/versions.tsv"
             git clone --depth 1 --branch "$tag" --recurse-submodules --shallow-submodules \
               "https://github.com/$repo.git" "$work/src/$name"
-            git -C "$work/src/$name" rev-parse HEAD >> /out/source-commits.txt
+            git -C "$work/src/$name" rev-parse HEAD >> "$OUTPUT_DIR/source-commits.txt"
             rm -rf "$work/src/$name/.git"
           }
           cmake_build() {
@@ -228,29 +241,28 @@ jobs:
           # Install glibc to a private sysroot, never over Trixie's host libc.
           # GNU binutils are intentionally confined to this GCC/glibc step.
           glibc_tag="$(latest_tag bminor/glibc 'glibc-([0-9]+)\.([0-9]+)')"
-          printf 'glibc\tbminor/glibc\t%s\n' "$glibc_tag" >> /out/versions.tsv
-          mkdir -p "$work/src/glibc" "$work/build/glibc" "$sysroot/usr/include"
+          printf 'glibc\tbminor/glibc\t%s\n' "$glibc_tag" >> "$OUTPUT_DIR/versions.tsv"
+          mkdir -p "$work/src/glibc" "$work/build/glibc" "$target_include"
           fetch "https://ftp.gnu.org/gnu/libc/$glibc_tag.tar.xz" \
             | tar -xJ --strip-components=1 -C "$work/src/glibc"
-          # Debian UAPI headers can link outside /usr/include; materialize them
-          # so relative symlinks cannot become dangling inside the private sysroot.
-          cp -aL /usr/include/linux /usr/include/asm-generic "$sysroot/usr/include/"
-          cp -aL /usr/include/aarch64-linux-gnu/asm "$sysroot/usr/include/"
-          test -r "$sysroot/usr/include/asm/errno.h"
+          # Materialize Debian UAPI header symlinks for the discovered target.
+          cp -aL "$system_include/linux" "$system_include/asm-generic" "$target_include/"
+          cp -aL "$system_include/$multiarch/asm" "$target_include/"
+          test -r "$target_include/asm/errno.h"
           (
             cd "$work/build/glibc"
             # No inherited -flto, LLD, stripping or --gc-sections for glibc.
             # Use Trixie's GCC 14 and GNU ld/as for glibc.
-            export CC=/usr/bin/gcc CXX=false LD=/usr/bin/ld AS=/usr/bin/as
-            export AR=/usr/bin/ar NM=/usr/bin/nm RANLIB=/usr/bin/ranlib
-            export OBJCOPY=/usr/bin/objcopy OBJDUMP=/usr/bin/objdump READELF=/usr/bin/readelf
-            export STRIP=/usr/bin/strip
+            export CC="$gcc" CXX=false LD="$gnu_bin/ld" AS="$gnu_bin/as"
+            export AR="$gnu_bin/ar" NM="$gnu_bin/nm" RANLIB="$gnu_bin/ranlib"
+            export OBJCOPY="$gnu_bin/objcopy" OBJDUMP="$gnu_bin/objdump" READELF="$gnu_bin/readelf"
+            export STRIP="$gnu_bin/strip"
             # +noras is a Clang-only CPU modifier; GCC does not accept it.
             # Keep the full requested CPU flags for every LLVM-built component.
             export CFLAGS='-O3 -mcpu=cortex-a76+nossbs -fno-lto'
             export CXXFLAGS="$CFLAGS" LDFLAGS='-fno-lto'
-            if ! "$work/src/glibc/configure" --prefix=/usr --libdir=/usr/lib \
-              --with-headers="$sysroot/usr/include" --enable-kernel=6.12 \
+            if ! "$work/src/glibc/configure" --prefix="$system_prefix" --libdir="$system_prefix/lib" \
+              --with-headers="$target_include" --enable-kernel=6.12 \
               --enable-static-nss --disable-nscd --disable-werror; then
               cat config.log
               exit 1
@@ -258,40 +270,40 @@ jobs:
             make -j"$jobs"
             make DESTDIR="$sysroot" install
           )
-          test -f "$sysroot/usr/lib/libc.a"
+          test -f "$target_lib/libc.a"
           completed+=("$work/src/glibc" "$work/build/glibc")
           clean_completed
 
           # Use matching LLVM 23 libc++, libc++abi, libunwind and compiler-rt.
           # These are the official Trixie LLVM toolchain packages, not libstdc++.
           # Rebase only the libc headers/startup objects through --sysroot.
-          llvm_lib=/usr/lib/llvm-23/lib
+          test -f "$llvm_cxx_include/__config"
           test -f "$llvm_lib/libc++.a"
           test -f "$llvm_lib/libc++abi.a"
           test -f "$llvm_lib/libunwind.a"
           export CFLAGS="$base_cflags --sysroot=$sysroot --rtlib=compiler-rt"
-          export CXXFLAGS="$base_cxxflags --sysroot=$sysroot --rtlib=compiler-rt -stdlib=libc++ -isystem /usr/lib/llvm-23/include/c++/v1"
+          export CXXFLAGS="$base_cxxflags --sysroot=$sysroot --rtlib=compiler-rt -stdlib=libc++ -isystem $llvm_cxx_include"
           export LDFLAGS="$base_ldflags --sysroot=$sysroot --rtlib=compiler-rt --unwindlib=libunwind -L$llvm_lib -L$prefix/lib -static -no-pie -Wl,--start-group -lc++ -lc++abi -lunwind -Wl,--end-group"
           export CPPFLAGS="-I$prefix/include"
           export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/share/pkgconfig"
           export PKG_CONFIG_LIBDIR="$PKG_CONFIG_PATH"
           export PATH="$prefix/bin:$PATH"
           cat > "$work/llvm23.cmake" <<CMAKE
-          set(CMAKE_C_COMPILER /usr/lib/llvm-23/bin/clang)
-          set(CMAKE_CXX_COMPILER /usr/lib/llvm-23/bin/clang++)
-          set(CMAKE_ASM_COMPILER /usr/lib/llvm-23/bin/clang)
-          set(CMAKE_LINKER /usr/lib/llvm-23/bin/ld.lld)
-          set(CMAKE_AR /usr/lib/llvm-23/bin/llvm-ar)
-          set(CMAKE_RANLIB /usr/lib/llvm-23/bin/llvm-ranlib)
-          set(CMAKE_NM /usr/lib/llvm-23/bin/llvm-nm)
-          set(CMAKE_STRIP /usr/lib/llvm-23/bin/llvm-strip)
-          set(CMAKE_OBJCOPY /usr/lib/llvm-23/bin/llvm-objcopy)
-          set(CMAKE_OBJDUMP /usr/lib/llvm-23/bin/llvm-objdump)
-          set(CMAKE_READELF /usr/lib/llvm-23/bin/llvm-readelf)
-          set(CMAKE_C_COMPILER_AR /usr/lib/llvm-23/bin/llvm-ar)
-          set(CMAKE_CXX_COMPILER_AR /usr/lib/llvm-23/bin/llvm-ar)
-          set(CMAKE_C_COMPILER_RANLIB /usr/lib/llvm-23/bin/llvm-ranlib)
-          set(CMAKE_CXX_COMPILER_RANLIB /usr/lib/llvm-23/bin/llvm-ranlib)
+          set(CMAKE_C_COMPILER "$CC")
+          set(CMAKE_CXX_COMPILER "$CXX")
+          set(CMAKE_ASM_COMPILER "$AS")
+          set(CMAKE_LINKER "$LD")
+          set(CMAKE_AR "$AR")
+          set(CMAKE_RANLIB "$RANLIB")
+          set(CMAKE_NM "$NM")
+          set(CMAKE_STRIP "$STRIP")
+          set(CMAKE_OBJCOPY "$OBJCOPY")
+          set(CMAKE_OBJDUMP "$OBJDUMP")
+          set(CMAKE_READELF "$READELF")
+          set(CMAKE_C_COMPILER_AR "$AR")
+          set(CMAKE_CXX_COMPILER_AR "$AR")
+          set(CMAKE_C_COMPILER_RANLIB "$RANLIB")
+          set(CMAKE_CXX_COMPILER_RANLIB "$RANLIB")
           set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
           set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
           set(CMAKE_PREFIX_PATH "$prefix")
@@ -315,7 +327,8 @@ jobs:
           clone_release openssl openssl/openssl 'openssl-([0-9]+)\.([0-9]+)\.([0-9]+)'
           (
             cd "$work/src/openssl"
-            ./Configure linux-aarch64 --prefix="$prefix" --libdir=lib --openssldir=/etc/ssl \
+            openssl_dir="$(openssl version -d | cut -d '"' -f2)"
+            ./Configure linux-aarch64 --prefix="$prefix" --libdir=lib --openssldir="$openssl_dir" \
               no-shared no-module no-dso no-tests no-docs no-comp
             make -j"$jobs"
             make install_sw
@@ -328,7 +341,7 @@ jobs:
           boost_tag="$(latest_tag boostorg/boost 'boost-([0-9]+)\.([0-9]+)\.([0-9]+)')"
           boost_version="${boost_tag#boost-}"
           IFS=. read -r boost_major boost_minor boost_patch <<< "$boost_version"
-          printf 'boost\tboostorg/boost\t%s\n' "$boost_tag" >> /out/versions.tsv
+          printf 'boost\tboostorg/boost\t%s\n' "$boost_tag" >> "$OUTPUT_DIR/versions.tsv"
           mkdir -p "$work/src/boost"
           fetch "https://archives.boost.io/release/$boost_version/source/boost_${boost_version//./_}.tar.bz2" \
             | tar -xj --strip-components=1 -C "$work/src/boost" "boost_${boost_version//./_}/boost"
@@ -392,7 +405,7 @@ jobs:
           if not candidates: sys.exit("No stable SQLite amalgamation found")
           print(max(candidates, key=lambda x: int(x[1]))[0])
           ')"
-          printf 'sqlite\thttps://www.sqlite.org/\t%s\n' "$sqlite_path" >> /out/versions.tsv
+          printf 'sqlite\thttps://www.sqlite.org/\t%s\n' "$sqlite_path" >> "$OUTPUT_DIR/versions.tsv"
           mkdir -p "$work/src/sqlite"
           fetch "https://www.sqlite.org/$sqlite_path" \
             | tar -xz --strip-components=1 -C "$work/src/sqlite"
@@ -410,14 +423,17 @@ jobs:
           # QtBase and QtTools must have exactly the same latest stable Qt tag.
           qt_tag="$(latest_tag qt/qtbase 'v(6)\.([0-9]+)\.([0-9]+)')"
           for module in qtbase qttools; do
-            printf '%s\tqt/%s\t%s\n' "$module" "$module" "$qt_tag" >> /out/versions.tsv
+            printf '%s\tqt/%s\t%s\n' "$module" "$module" "$qt_tag" >> "$OUTPUT_DIR/versions.tsv"
             git clone --depth 1 --branch "$qt_tag" "https://github.com/qt/$module.git" "$work/src/$module"
             rm -rf "$work/src/$module/.git"
           done
           # qlalr only regenerates Qt developer grammars; qBittorrent does not
           # need it, and its legacy comparisons do not compile with libc++/C++26.
           sed -i '/^add_subdirectory(qlalr)$/d' "$work/src/qtbase/src/tools/CMakeLists.txt"
+          # Static Qt otherwise embeds the temporary build prefix in runtime
+          # paths, including qtlogging.ini. Resolve them relative to the executable.
           cmake_build qtbase \
+            -DQT_FEATURE_relocatable=ON \
             -DQT_BUILD_TESTS=OFF -DQT_BUILD_EXAMPLES=OFF -DQT_BUILD_BENCHMARKS=OFF \
             -DQT_FEATURE_cxx2c=ON -DQT_FEATURE_shared=OFF -DQT_FEATURE_static=ON \
             -DQT_FEATURE_icu=OFF -DQT_FEATURE_gui=OFF -DQT_FEATURE_widgets=OFF \
@@ -481,24 +497,47 @@ jobs:
           fi
           # Full LTO merges/renames input objects. Verify mimalloc using its
           # runtime diagnostics below rather than an object filename in the map.
-          grep -Fq "$sysroot/usr/lib/libc.a" "$work/qbittorrent.map"
+          grep -Fq "$target_lib/libc.a" "$work/qbittorrent.map"
           if grep -Eq 'libstdc\+\+|libgcc|libicu' "$work/qbittorrent.map"; then
             printf '%s\n' '::error::Unexpected GCC runtime or ICU in the final link.' >&2
             exit 1
           fi
           # Test with no shared libraries present, so accidental dlopen/NSS
           # dependencies cannot be concealed by the build container's libraries.
-          smoke_root="$work/smoke-root"
-          mkdir -p "$smoke_root/etc/ssl/certs" "$smoke_root/dev" "$smoke_root/tmp"
-          cp "$binary" "$smoke_root/qbittorrent-nox"
-          cp /etc/resolv.conf /etc/hosts /etc/nsswitch.conf "$smoke_root/etc/"
-          cp /etc/ssl/certs/ca-certificates.crt "$smoke_root/etc/ssl/certs/"
-          mknod -m 666 "$smoke_root/dev/null" c 1 3
-          mknod -m 666 "$smoke_root/dev/urandom" c 1 9
-          MIMALLOC_VERBOSE=1 chroot "$smoke_root" /qbittorrent-nox --version \
+          smoke_root="$(mktemp -d --tmpdir="$work")"
+          chmod 0755 "$smoke_root"
+          smoke_binary="./${binary##*/}"
+          cp "$binary" "$smoke_root/"
+          smoke_home="$(mktemp -d --tmpdir="$smoke_root")"
+          smoke_home="${smoke_home#"$smoke_root"}"
+          env -u QT_LOGGING_CONF -u QT_LOGGING_RULES \
+            HOME="$smoke_home" XDG_CACHE_HOME="$smoke_home/cache" \
+            XDG_CONFIG_HOME="$smoke_home/config" XDG_DATA_HOME="$smoke_home/data" \
+            TMPDIR="$smoke_home" TMP="$smoke_home" TEMP="$smoke_home" MIMALLOC_VERBOSE=1 \
+            chroot "$smoke_root" "$smoke_binary" --version \
             > "$work/version.txt" 2> "$work/mimalloc.txt"
           grep -qi mimalloc "$work/mimalloc.txt"
-          chroot "$smoke_root" /qbittorrent-nox --help > /dev/null
+          chroot "$smoke_root" "$smoke_binary" --help > "$work/help.txt"
+          # Make the generated build directory inaccessible inside the chroot.
+          # A non-relocatable Qt build would still try to read its qtlogging.ini.
+          mkdir -p "$smoke_root$work"
+          chmod 0700 "$smoke_root$work"
+          smoke_uid="$(id -u nobody)"
+          smoke_gid="$(id -g nobody)"
+          smoke_home="$(mktemp -d --tmpdir="$smoke_root")"
+          chown "$smoke_uid:$smoke_gid" "$smoke_home"
+          smoke_home="${smoke_home#"$smoke_root"}"
+          env -u QT_LOGGING_CONF -u QT_LOGGING_RULES \
+            HOME="$smoke_home" XDG_CACHE_HOME="$smoke_home/cache" \
+            XDG_CONFIG_HOME="$smoke_home/config" XDG_DATA_HOME="$smoke_home/data" \
+            TMPDIR="$smoke_home" TMP="$smoke_home" TEMP="$smoke_home" \
+            chroot --userspec="$smoke_uid:$smoke_gid" "$smoke_root" "$smoke_binary" --version \
+            > "$work/unprivileged-version.txt" 2> "$work/unprivileged-startup.log"
+          if grep -Fq 'Failed to load file' "$work/unprivileged-startup.log"; then
+            cat "$work/unprivileged-startup.log" >&2
+            printf '%s\n' '::error::Unprivileged startup still uses an inaccessible Qt configuration path.' >&2
+            exit 1
+          fi
           # Exercise the WebUI in the target Trixie environment, which provides
           # standard OS facilities such as /proc, user records and locale data.
           # The library-free chroot above separately verifies static startup.
@@ -522,13 +561,13 @@ jobs:
           kill -TERM "$qbt_pid"
           wait "$qbt_pid"
           "$STRIP" --strip-all "$binary"
-          install -m 0755 "$binary" /out/qbittorrent-nox
-          cp "$work/version.txt" /out/
+          install -m 0755 "$binary" "$OUTPUT_DIR/qbittorrent-nox"
+          cp "$work/version.txt" "$OUTPUT_DIR/"
           dpkg-query -W 'clang-23' 'lld-23' 'llvm-23' 'libclang-rt-23-dev' \
-            'libc++-23-dev' 'libc++abi-23-dev' 'libunwind-23-dev' >> /out/toolchain-packages.tsv
+            'libc++-23-dev' 'libc++abi-23-dev' 'libunwind-23-dev' >> "$OUTPUT_DIR/toolchain-packages.tsv"
           printf 'CFLAGS=%s\nCXXFLAGS=%s\nLDFLAGS=%s\n' \
-            "$base_cflags" "$base_cxxflags" "$base_ldflags" > /out/build-flags.txt
-          cd /out
+            "$base_cflags" "$base_cxxflags" "$base_ldflags" > "$OUTPUT_DIR/build-flags.txt"
+          cd "$OUTPUT_DIR"
           sha256sum qbittorrent-nox > SHA256SUMS
           cat version.txt versions.tsv SHA256SUMS
           BUILD
@@ -537,7 +576,7 @@ jobs:
         uses: actions/upload-artifact@v7.0.2
         with:
           name: qbittorrent-nox-debian13-arm64-cortex-a76
-          path: dist/
+          path: ${{ env.OUTPUT_DIR }}/
           if-no-files-found: error
           compression-level: 0
 
@@ -546,23 +585,25 @@ jobs:
         uses: actions/upload-artifact@v7.0.2
         with:
           name: qbittorrent-build-failure-diagnostics
-          path: dist/
+          path: ${{ env.OUTPUT_DIR }}/
           if-no-files-found: warn
 
       - name: Stop isolated Docker and release RAM
         if: always()
         run: |
           set -euo pipefail
-          ram_root="$HOME/.cache/codex-docker"
-          if ! mountpoint -q "$ram_root"; then exit 0; fi
+          if [[ -z "${RAM_ROOT:-}" ]]; then exit 0; fi
+          ram_root="$RAM_ROOT"
+          if ! mountpoint -q "$ram_root"; then rmdir "$ram_root"; exit 0; fi
           export DOCKER_HOST="unix://$ram_root/docker.sock"
-          docker rm --force qbt-build > /dev/null 2>&1 || true
+          docker rm --force qbt-build > "$ram_root/cleanup.log" 2>&1 || true
           if sudo test -f "$ram_root/dockerd.pid"; then
             daemon_pid="$(sudo cat "$ram_root/dockerd.pid")"
             sudo kill -TERM "$daemon_pid"
             for ((attempt=0; attempt<30; attempt++)); do
-              if ! sudo kill -0 "$daemon_pid" 2>/dev/null; then break; fi
+              if ! sudo kill -0 "$daemon_pid" 2> "$ram_root/daemon-status.log"; then break; fi
               sleep 1
             done
           fi
           sudo umount --recursive "$ram_root"
+          rmdir "$ram_root"
