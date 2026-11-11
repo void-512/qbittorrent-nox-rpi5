@@ -400,6 +400,9 @@ jobs:
             git clone --depth 1 --branch "$qt_tag" "https://github.com/qt/$module.git" "$work/src/$module"
             rm -rf "$work/src/$module/.git"
           done
+          # qlalr only regenerates Qt developer grammars; qBittorrent does not
+          # need it, and its legacy comparisons do not compile with libc++/C++26.
+          sed -i '/^add_subdirectory(qlalr)$/d' "$work/src/qtbase/src/tools/CMakeLists.txt"
           cmake_build qtbase \
             -DQT_BUILD_TESTS=OFF -DQT_BUILD_EXAMPLES=OFF -DQT_BUILD_BENCHMARKS=OFF \
             -DQT_FEATURE_cxx2c=ON -DQT_FEATURE_shared=OFF -DQT_FEATURE_static=ON \
